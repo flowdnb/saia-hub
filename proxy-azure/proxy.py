@@ -26,7 +26,7 @@ import re
 
 
 ############################################################################
-## This is the OpenAI proxy. It forwards requests to external servers     ##
+## This is the Azure proxy. It forwards requests to Azure OpenAI models   ##
 ############################################################################
 ## To run this app manually, execute the following command:               ##
 ##     uvicorn proxy:app --workers 1 --host localhost --port <port>       ##
@@ -34,7 +34,6 @@ import re
 
 ## Configuration
 testing_mode = False                # If true, only test message is displayed
-use_openai = True                   # If True, enables OpenAI service
 enable_accounting = True            # If True, counts tokens
 
 ## Log configuration
@@ -49,7 +48,7 @@ log_level = logging.INFO
 
 ## Reserved variables
 app = FastAPI(debug=False)
-openai_services = ['openai-gpt41', 'openai-gpt41-mini', 'openai-gpt4o-mini', 'openai-gpt4o', 'openai-o1', 'openai-o3', 'openai-o1-mini', 'openai-o3-mini', 'openai-o4-mini']
+azure_services = None
 openai_api_version = "2024-12-01-preview"  # OpenAI API version
 openai_system_prompt =  """You are an intelligent chatbot hosted by GWDG to help users answer their scientific questions.
     Instructions: 
@@ -69,19 +68,10 @@ def get_secret(secret_name):
     except IOError:
         return None
 
-if use_openai:
-    openai_config = json.loads(get_secret('openai_config'))
-    openai_key = openai_config["openai_key"]
-    openai_endpoint = openai_config["openai_endpoint"]
-    openai_deployment_name_gpt41_mini = openai_config['openai_deployment_name_gpt41_mini']
-    openai_deployment_name_gpt41 = openai_config['openai_deployment_name_gpt41']
-    openai_deployment_name_gpt4o_mini = openai_config['openai_deployment_name_gpt4o_mini']
-    openai_deployment_name_gpt4o = openai_config['openai_deployment_name_gpt4o']
-    openai_deployment_name_o1_mini = openai_config['openai_deployment_name_o1_mini']
-    openai_deployment_name_o1 = openai_config['openai_deployment_name_o1']
-    openai_deployment_name_o3 = openai_config['openai_deployment_name_o3']
-    openai_deployment_name_o3_mini = openai_config['openai_deployment_name_o3_mini']
-    openai_deployment_name_o4_mini = openai_config['openai_deployment_name_o4_mini']
+openai_config = json.loads(get_secret('openai_config'))
+openai_key = openai_config["openai_key"]
+openai_endpoint = openai_config["openai_endpoint"]
+azure_services = openai_config["deployments"]
 
 @app.on_event("startup")
 async def startup_event():
@@ -100,14 +90,7 @@ async def startup_event():
     # ## Initialize logging
     logging.basicConfig(handlers = handlers, level=log_level)
     logging.info("Startup complete.")
-    logging.debug("Secrets:")
-    logging.debug(openai_key)
-    logging.debug(openai_deployment_name_gpt41_mini)
-    logging.debug(openai_deployment_name_gpt41)
-    logging.debug(openai_deployment_name_gpt4o)
-    logging.debug(openai_deployment_name_o1)
-    logging.debug(openai_deployment_name_o1_mini)
-    
+    logging.debug(f"Config: {azure_services}" )
 
 ############################################################################
 ## Shutdown                                                               ##
@@ -150,6 +133,10 @@ def extract_tokens(messages, model="gpt-3.5-turbo-0613"):
         encoding = tiktoken.get_encoding("cl100k_base")
 
     if model in {
+        "gpt5",
+        "gpt5-mini",
+        "gpt5-nano"
+        "gpt5-chat"
         "gpt-3.5-turbo-0613",
         "gpt-3.5-turbo-16k-0613",
         "gpt-4-0314",
@@ -159,6 +146,7 @@ def extract_tokens(messages, model="gpt-3.5-turbo-0613"):
         "gpt-4o",
         "gpt-4o-mini",
         "o1",
+        "o3",
         "chat-academic-cloud-gpt35",
         "chat-academic-cloud-gpt4",
         "chat-academic-cloud-gpt41",
@@ -168,11 +156,18 @@ def extract_tokens(messages, model="gpt-3.5-turbo-0613"):
         "chat-academic-cloud-o1-mini",
         "chat-academic-cloud-o1-preview",
         "chat-academic-cloud-o1",
+        "chat-academic-cloud-o3",
         "chat-academic-cloud-o3-mini",
         "chat-academic-cloud-o4-mini",
         }:
         tokens_per_message = 3
         tokens_per_name = 1
+    elif "gpt5" in model:
+        return extract_tokens(messages, model="gpt5")
+    elif "gpt-4o" in model:
+        return extract_tokens(messages, model="gpt-4o")
+    elif "openai-o1" in model:
+        return extract_tokens(messages, model="o1")
     elif model == "gpt-3.5-turbo-0301":
         tokens_per_message = 4  # every message follows <|start|>{role/name}\n{content}<|end|>\n
         tokens_per_name = -1  # if there's a name, the role is omitted
@@ -180,10 +175,6 @@ def extract_tokens(messages, model="gpt-3.5-turbo-0613"):
         return extract_tokens(messages, model="gpt-3.5-turbo-0613")
     elif "gpt-4" in model or "gpt4" in model:
         return extract_tokens(messages, model="gpt-4-0613")
-    elif "gpt-4o" in model:
-        return extract_tokens(messages, model="gpt-4o")
-    elif "openai-o1" in model:
-        return extract_tokens(messages, model="o1")
     else:
         raise NotImplementedError(
             f"""num_tokens_from_messages() is not implemented for model {model}. See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens."""
@@ -227,8 +218,6 @@ def extract_tokens(messages, model="gpt-3.5-turbo-0613"):
 @app.post("/passthrough/{path:path}", status_code=200)
 async def get_openai_response(path: str, request: Request = None) -> StreamingResponse:
     """Send message and history to and get response from OpenAI"""
-    if not use_openai:
-        raise HTTPException(403, "Service locked by administrator")
     method = str(request.method)
     if method == 'GET':
         return Response("OK", 200)
@@ -262,10 +251,14 @@ async def get_openai_response(path: str, request: Request = None) -> StreamingRe
         'portal': "Chat AI",
         'status': "PENDING",
     }
-    logging.info("Inference Request: " + json.dumps(inference))
 
-    if inference['service'] not in openai_services:
-        raise HTTPException(404, "Service not found")
+    if not inference['service'] or inference['service'] not in azure_services.keys():
+        if "model" in data:
+            inference['service'] = data["model"]
+        else:
+            raise HTTPException(404, "Service not found")
+        logging.info("Inference Request: " + json.dumps(inference))
+    
     async def stream():
         try:
             logging.debug("Activating OpenAI client")
@@ -278,27 +271,8 @@ async def get_openai_response(path: str, request: Request = None) -> StreamingRe
             logging.error("Could not activate OpenAI client: " + str(e))
             return
         try:
-            logging.debug(f"inference service is: {inference['service']}")
-            if inference['service'] == 'openai-gpt41':
-                model = openai_deployment_name_gpt41
-            elif inference['service'] == 'openai-gpt41-mini':
-                model = openai_deployment_name_gpt41_mini
-            elif inference['service'] == 'openai-gpt4o-mini':
-                model = openai_deployment_name_gpt4o_mini
-            elif inference['service'] == 'openai-gpt4o':
-                model = openai_deployment_name_gpt4o
-            elif inference['service'] == 'openai-o1-mini':
-                model = openai_deployment_name_o1_mini
-            elif inference['service'] == 'openai-o1':
-                model = openai_deployment_name_o1
-            elif inference['service'] == 'openai-o3':
-                model = openai_deployment_name_o3
-            elif inference['service'] == 'openai-o3-mini':
-                model = openai_deployment_name_o3_mini
-            elif inference['service'] == 'openai-o4-mini':
-                model = openai_deployment_name_o4_mini
-            else:
-                raise HTTPException(404, "Model not found")
+            model = azure_services[inference['service']]
+            logging.debug(f"inference service is: {inference['service']} - {model}")
             full_response = ''
             history = [m for m in data['messages'] if m["role"] != "system"]
             if "o1" not in model:
@@ -313,7 +287,7 @@ async def get_openai_response(path: str, request: Request = None) -> StreamingRe
                         if not len(r.choices) > 0 or not r.choices[0].delta or not r.choices[0].delta.content:
                             continue
                         full_response += r.choices[0].delta.content
-                        response_str = 'data: ' + json.dumps(r.dict()) + '\n'
+                        response_str = 'data: ' + json.dumps(r.dict()) + '\n\n'
                         yield response_str
                         #yield r.choices[0].delta.content
                     inference['status'] = 'COMPLETED'
